@@ -4,6 +4,7 @@ from fastapi import HTTPException
 from sqlalchemy import select,delete
 from .models import Bale,Blend,BlendPortion,Audit
 from .quality_models import SupplierLot,LotBale
+from .assignment_models import BaleAssignment
 
 def obj(x):return {c.name:float(getattr(x,c.name)) if isinstance(getattr(x,c.name),Decimal) else getattr(x,c.name) for c in x.__table__.columns}
 def get(s,model,id,lock=False):
@@ -14,6 +15,10 @@ def get(s,model,id,lock=False):
     return x
 def audit(s,u,action,detail):s.add(Audit(actor=u['email'],action=action,detail=str(detail),at=datetime.now(timezone.utc).isoformat()))
 def portions(s,b):return s.scalars(select(BlendPortion).where(BlendPortion.blend_id==b.id).order_by(BlendPortion.bale_id)).all()
+def latest_assignments(s,bale_ids):
+    latest={}
+    for x in s.scalars(select(BaleAssignment).where(BaleAssignment.bale_id.in_(bale_ids)).order_by(BaleAssignment.id)):latest[x.bale_id]=x
+    return latest
 def view(s,b):
     d=obj(b);ps=portions(s,b);d['portions']=[{**obj(p),'bale_code':s.get(Bale,p.bale_id).code} for p in ps];d['total_kg']=float(sum((p.kg for p in ps),Decimal(0)));return d
 def set_portions(s,b,data,u):
@@ -21,11 +26,16 @@ def set_portions(s,b,data,u):
     ids=[x.bale_id for x in data.portions]
     if len(set(ids))!=len(ids):raise HTTPException(409,'同一料包只能称入一次')
     bales={x.id:x for x in s.scalars(select(Bale).where(Bale.id.in_(ids)).order_by(Bale.id).with_for_update())}
+    latest=latest_assignments(s,ids)if ids else{}
     for p in data.portions:
         x=bales.get(p.bale_id)
         if not x:raise HTTPException(404,'所选料包不存在')
-        if x.cluster_id is None:raise HTTPException(409,'料包尚未完成分群检验')
+        if x.cluster_id is None:
+            rec=latest.get(x.id)
+            if rec and rec.state=='pending_recheck':raise HTTPException(409,f'{x.code}偏离群训练半径，待补检重判后才能上秤')
+            raise HTTPException(409,'料包尚未完成分群检验')
         if p.kg>x.available_kg:raise HTTPException(409,f'{x.code}可用重量不足，未保存配方')
+    if len({bales[p.bale_id].cluster_version for p in data.portions})>1:raise HTTPException(409,'秤台只接纳同分群版本料包，请整体重新称料')
     s.execute(delete(BlendPortion).where(BlendPortion.blend_id==b.id))
     for p in data.portions:
         x=bales[p.bale_id];s.add(BlendPortion(blend_id=b.id,bale_id=x.id,kg=p.kg,cluster_snapshot=x.cluster_id,version_snapshot=x.cluster_version,pvc_snapshot=x.pvc_ppm,melt_snapshot=x.melt_index,moisture_snapshot=x.moisture))

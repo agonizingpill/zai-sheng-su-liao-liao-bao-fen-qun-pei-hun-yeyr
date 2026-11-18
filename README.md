@@ -19,12 +19,12 @@ docker compose exec -T backend python -m scripts.seed_demo
 |---|---|---|---|
 |admin 投料主管|admin@huanli.local|Blend2026!|全部操作、最终投料放行、供应批隔离/解除、烘干验收、成品证书签发、发车冻结清单|
 |blender 配混员|blender@huanli.local|Blend2026!|检验、分群、立单、称料、审秤、待放行单退回；供应批挂包、粒料取样与隔离复检、烘干安排/复测、包装称重/封箱、客户签收；无最终投料及发证权限|
-|viewer 质检观察员|viewer@huanli.local|Blend2026!|只读九个页面及交接轨迹|
+|viewer 质检观察员|viewer@huanli.local|Blend2026!|只读十个页面及交接轨迹|
 
 ## 业务流程与约束
 
 1. 料包堆场登记编号、原始kg、熔指、水分、PVC。编号唯一；可用量不小于零且不超过原始重量。
-2. 可混群落由Python worker实际计算，输入三项检验特征。未分群新料不能直接称入。
+2. 可混群落由Python worker实际计算，输入三项检验特征。未分群新料不能直接称入；新料包可沿用当前发布版本的标准化参数与群中心归群，不参与重训，偏离训练半径的待复检、补检后重判，判定与补检/换版并发时整批作废且保留原群号，同批重试不重复写入；旧版本缺少判定依据时拒绝归群，不以当前全场补造。
 3. 配混秤台立单目标kg与PVC上限；每份称料行关联配方与料包，保存**群号、分群版本及质量快照**。同包不可重复，保存时就拒绝超过当前可用量。
 4. 审秤校验同版本同群、总重等于目标、Σ(重量×PVC)/总重≤上限、每包可用量足够；全部通过进入ready。审秤不扣料。
 5. 主管放行先锁配方，再按料包ID顺序`SELECT FOR UPDATE`；重新校验余量后，在一个事务扣减所有料包，配方变released并保存签署人。任一失败整体回滚。重复放行、已放行改单和退回都拒绝。
@@ -36,7 +36,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 9. 包装箱码追溯：certified成品按唯一箱码分包，锁同成品校验有效包装累计≤actual_kg；open可改重或取消释放额度，sealed后冻结，证书快照随箱保存。已装车仍计入累计，避免重复包装同一产出。
 10. 装车客户签收：同车只能装同配方sealed箱，ShipmentPack.pack_id唯一，加载后包状态loaded阻止再次出库；主管发车保存冻结manifest。实收与清单差率绝对值>0.5%须至少8字依据，记录客户签收快照后不得重复签收。仅本地记录交接，无实际运输消息。
 
-已被任何配方引用的料包质量/原始重量不得修改；可用量只在放行扣减。重做全场分群会更新堆场当前群号，既有配方继续使用原称料时的质量/群号快照。对旧快照配方添加新版本料包会被审秤拦截，需退回并整体重新称料。
+已被任何配方引用的料包质量/原始重量不得修改；可用量只在放行扣减。重做全场分群会更新堆场当前群号，既有配方继续使用原称料时的质量/群号快照。对旧快照配方添加新版本料包会在称料保存时被拦截，需退回并整体重新称料。
 
 ### 一天的工作剧本
 
@@ -66,7 +66,9 @@ V3演练：11月24日DRY-B接BL-PELLET-UI的100kg投料，08:00—12:00烘干；
 
 V3 `backend/src/production_models.py`定义Dryer/DryingRun/PelletPack/BlendShipment/ShipmentPack；`production_schemas.py`校验时间、含水、称重与客户收货；`production_service.py`设备锁/时段重叠、累计包装锁、装车唯一和签收差率；`production_routes.py`提供`/dryers`、`/drying-runs`、`/pellet-packs`、`/blend-shipments`。新加5张表，原表列无变更，create_all兼容历史记录。
 
-`frontend/src/pages/yard.js`堆场；`clusters.js`真实散点与中心；`bench.js`可增删称料行；`release.js`交接簿；`lots.js`供应隔离复核；`pellets.js`粒料检验与证书；`drying.js`含水复检；`packs.js`包装箱码；`shipments.js`装车客户签收。`components/labels.js`共享群标签、状态条、标签页、标题与通知，群标签在图谱、秤台与放行中复用。`utils/api.js`会话/接口/store，`utils/format.js`数字/转义/上海时区。角色、配方状态、供应批、成品检验、烘干、包装和装车状态枚举定义在`backend/src/constants.py`、`frontend/src/constants.js`，状态实际转移在`blending.py`与`main.py`，标签渲染在`components/labels.js`。
+V4 `backend/src/assignment_models.py`定义ClusterModel/ClusterMeta/AssignBatch/BaleAssignment...`assignment_schemas.py`校验批次键与版本；`assignment_service.py`按发布版本判定归群、距离门限、待复检与并发作废；`assignment_routes.py`提供`/assignments`。新加4张表，原表列无变更，create_all兼容历史记录。
+
+`frontend/src/pages/yard.js`堆场；`clusters.js`真实散点与中心；`assign.js`新料归群与待复检核对；`bench.js`可增删称料行；`release.js`交接簿；`lots.js`供应隔离复核；`pellets.js`粒料检验与证书；`drying.js`含水复检；`packs.js`包装箱码；`shipments.js`装车客户签收。`components/labels.js`共享群标签、状态条、标签页、标题与通知，群标签在图谱、秤台与放行中复用。`utils/api.js`会话/接口/store，`utils/format.js`数字/转义/上海时区。角色、配方状态、供应批、成品检验、烘干、包装和装车状态枚举定义在`backend/src/constants.py`、`frontend/src/constants.js`，状态实际转移在`blending.py`与`main.py`，标签渲染在`components/labels.js`。
 
 Compose恰好frontend/backend/worker/db/redis五服务，全部healthcheck。MySQL健康检查采用127.0.0.1业务账号SELECT1，避开初始化临时socket；前端和后端也用127.0.0.1。数据库、Redis和模型文件/心跳分别为命名卷。宿主默认地址池已用尽，本项目显式10.221.26.0/24；换环境冲突时调整networks。环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET。内网DATABASE_URL/REDIS_URL/SEED_DEMO由Compose设置。
 
